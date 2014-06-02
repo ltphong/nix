@@ -1,0 +1,195 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          iptables
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: stateful firewall
+### END INIT INFO
+
+### Source functions and binaries
+. /lib/lsb/init-functions
+IPT="/sbin/iptables"
+echo="/bin/echo"
+
+test -x $iptables || exit 5
+test -x $echo || exit 5
+
+### Set up variables
+IF=`/sbin/route | grep -i 'default' | awk '{print $8}'`
+IP=`/sbin/ifconfig $IF | grep "inet addr" | awk -F":" '{print $2}' | awk '{print $1}'`
+DNS="172.30.192.21 8.8.8.8 8.8.4.4"
+NET="any/0"
+SERV_TCP="80 443 5666"
+SERV_UDP="53 123 161"
+HI_PORTS="1024:65535"
+NON_NET="10.0.0.0/8 192.168.0.0/16 224.0.0.0/4 240.0.0.0/5 169.254.0.0/16 192.0.2.0/24"
+OK_ICMP="0 3 4 8 11"
+TRUST_SSH="172.16.0.0/12"
+#BADIPS=$(egrep -v -E "^#|^$" /root/scripts/blocked.fw)
+
+start() {
+### Delete all existing rules
+$IPT -F
+$IPT -t nat -F
+$IPT -t mangle -F
+$IPT -X
+
+### Set up policies
+$IPT -P INPUT DROP
+$IPT -P OUTPUT DROP
+$IPT -P FORWARD DROP
+
+### Block private networks
+for entry in $NON_NET; do
+$IPT -A INPUT -i $IF -s $entry -m limit --limit 1/s -j LOG --log-level 5 --log-prefix "BAD_NET: "
+$IPT -A INPUT -i $IF -s $entry -j DROP
+done
+
+### Block spoofing packets
+$IPT -A INPUT -i $IF -s $IP -d $IP -m limit --limit 1/s -j LOG --log-prefix "SPOOFING: "
+$IPT -A INPUT -i $IF -s $IP -d $IP -j DROP
+
+### Drop INVALID packets
+$IPT -A INPUT -m state --state INVALID -m limit --limit 1/s -j LOG --log-prefix "INVALID_STATE: "
+$IPT -A INPUT -m state --state INVALID -j DROP
+
+### Drop fragments
+$IPT -A INPUT -i $IF -f -j DROP
+
+### Block bad flags
+$IPT -A INPUT -i $IF -p tcp --tcp-flags SYN,RST SYN,RST -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags SYN,FIN SYN,FIN -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ACK,PSH PSH 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ACK,URG URG 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags FIN,ACK FIN 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags FIN,RST FIN,RST -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL FIN 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL ALL 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL NONE 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL FIN,PSH,URG -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL SYN,FIN 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL URG,PSH,SYN,FIN	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL SYN,RST,ACK,FIN,URG -s $NET -j DROP
+
+### Drop broadcast / multicast
+$IPT -A INPUT -i $IF -m pkttype --pkt-type broadcast 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -m pkttype --pkt-type multicast 	-s $NET -j DROP
+
+### Block bad guys
+#for ip in $BADIPS; do
+#    $IPT -A INPUT -s $ip -j DROP
+#    $IPT -A OUTPUT -d $ip -j DROP
+#done
+
+### Accept loopback traffic
+$IPT -A INPUT -i lo -j ACCEPT
+$IPT -A OUTPUT -o lo -j ACCEPT
+
+### Log SSH & MySQL access
+$IPT -A INPUT ! -i lo -p tcp -m multiport --dports 22,3306 -s 0/0 -d 0/0 --syn -j ULOG
+
+#$IPT -A INPUT -p tcp -i $IF -s $NET -m state --state NEW -m recent --set
+#$IPT -A INPUT -p tcp -i $IF -s $NET -m state --state NEW -m recent --update --seconds 20 --hitcount 10 -j DROP
+
+### Drop UDP scan
+#$IPT -A INPUT -p udp -s $NET -m length --length 0:28 -j DROP
+
+### SYN check
+$IPT -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
+
+### Allow SSH from TRUSTED_IP
+$IPT -A INPUT  -i $IF -p tcp   --syn -s $TRUST_SSH -d $IP  --dport 22 -m state --state NEW -m length --length 40:60 -m limit --limit 3/s --limit-burst 5 -j ACCEPT
+$IPT -A OUTPUT -o $IF -p tcp ! --syn -s $IP  -d $TRUST_SSH --sport 22 -m state --state ESTABLISHED -j ACCEPT
+$IPT -A INPUT  -i $IF -p tcp ! --syn -s $TRUST_SSH -d $IP  --dport 22 -m state --state ESTABLISHED -j ACCEPT
+
+### Allow HTTP & other
+for port in $SERV_TCP; do
+$IPT -A INPUT  -i $IF -p tcp   --syn -s $NET -d $IP  --dport $port -m state --state NEW -m length --length 40:60 -m limit --limit 3/s --limit-burst 5 -j ACCEPT
+$IPT -A OUTPUT -o $IF -p tcp ! --syn -s $IP  -d $NET --sport $port -m state --state ESTABLISHED -j ACCEPT
+$IPT -A INPUT  -i $IF -p tcp ! --syn -s $NET -d $IP  --dport $port -m state --state ESTABLISHED -j ACCEPT
+done
+
+### Allow UDP
+for port in $SERV_UDP; do
+if test $port -eq 53
+then
+$IPT -A INPUT -i $IF -p udp -s $NET --sport $port -d $IP --dport $port -m state --state NEW,ESTABLISHED -m limit --limit 2/s --limit-burst 2 -j ACCEPT
+$IPT -A OUTPUT -o $IF -p udp -s $IP --sport $port -d $NET --dport $port -m state --state ESTABLISHED -m limit --limit 2/s --limit-burst 2 -j ACCEPT
+else
+$IPT -A INPUT -i $IF -p udp -s $NET --sport $HI_PORTS -d $IP --dport $port -m state --state NEW -j ACCEPT
+$IPT -A OUTPUT -o $IF -p udp -s $IP --sport $port -d $NET --dport $HI_PORTS -m state --state ESTABLISHED -j ACCEPT
+fi
+done
+
+### Allow ICMP
+for item in $OK_ICMP; do
+$IPT -A INPUT -i $IF -s $NET -p icmp --icmp-type $item -m length --length 42:43 -m limit --limit 1/s --limit-burst 1 -j ACCEPT
+$IPT -A OUTPUT -o $IF -s $IP -p icmp --icmp-type $item -m length --length 42:43 -m limit --limit 1/s --limit-burst 1 -j ACCEPT
+done
+
+### Allow OUT - UDP (53) TCP (80,443,25)
+for entry in $DNS; do
+$IPT -A OUTPUT -o $IF -p udp -s $IP --sport $HI_PORTS -d $entry --dport 53 -m state --state NEW,ESTABLISHED -j ACCEPT
+$IPT -A INPUT -i $IF -p udp -s $entry --sport 53 -d $IP --dport $HI_PORTS -m state --state ESTABLISHED -j ACCEPT
+done
+$IPT -A OUTPUT -o $IF -s $IP -p tcp -d $NET -m multiport --dport 80,443,25 -m state --state NEW,ESTABLISHED -j ACCEPT
+$IPT -A INPUT -i $IF -d $IP -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+### Allow monitoring (nagios/cacti)
+#$IPT -A INPUT -d $IP -p tcp -m tcp --dport 5666 -j ACCEPT
+#$IPT -A INPUT -d $IP -p udp -m udp --dport 161 -j ACCEPT
+
+#$IPT -A FORWARD -p tcp -i $IF -m state --state NEW -m recent --set
+#$IPT -A FORWARD -p tcp -i $IF -m state --state NEW -m recent --update --seconds 20 --hitcount 10 -j DROP
+
+### Log & drop bad packet
+$IPT -A INPUT -i $IF -d $IP -m limit --limit 1/s -j LOG --log-level 5 --log-prefix "BAD_INPUT: "
+$IPT -A INPUT -i $IF -d $IP -j DROP
+$IPT -A OUTPUT -o $IF -d $IP -m limit --limit 1/s -j LOG --log-level 5 --log-prefix "BAD_OUTPUT: "
+$IPT -A OUTPUT -o $IF -d $IP -j DROP
+$IPT -A FORWARD -i $IF -d $IP -m limit --limit 1/s -j LOG --log-level 5 --log-prefix "BAD_FORWARD: "
+$IPT -A FORWARD -i $IF -d $IP -j DROP
+
+### Disble routing
+$echo 0 > /proc/sys/net/ipv4/ip_forward
+}
+
+stop() {
+### Delete all existing rules.
+$IPT -F
+$IPT -t nat -F
+$IPT -t mangle -F
+$IPT -X
+
+### Set up policies.
+$IPT -P INPUT ACCEPT
+$IPT -P OUTPUT ACCEPT
+$IPT -P FORWARD ACCEPT
+}
+
+case $1 in
+        start)
+                log_daemon_msg "Starting firewall"
+                start
+                log_end_msg $?
+                ;;
+        stop)
+                log_daemon_msg "Stopping firewall"
+                stop
+                log_end_msg $?
+                ;;
+        restart)
+                log_daemon_msg "Restarting firewall"
+                stop
+                        if [ -z "$?" -o "$?" = "0" ]; then
+                                start
+                        fi
+                log_end_msg $?
+                ;;
+        *)
+                echo "Usage: $0 {start|stop|restart}"
+                exit 2
+                ;;
+esac
