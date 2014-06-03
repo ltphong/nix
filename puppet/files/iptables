@@ -1,0 +1,160 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          iptables
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: stateful firewall
+### END INIT INFO
+
+
+# Source functions and binaries
+. /lib/lsb/init-functions
+IPT="/sbin/iptables"
+echo="/bin/echo"
+
+test -x $iptables || exit 5
+test -x $echo || exit 5
+
+# Set up variables.
+IF=`/sbin/route | grep -i 'default' | awk '{print $8}'`
+IP=`/sbin/ifconfig eth0 | grep "inet addr" | awk -F":" '{print $2}' | awk '{print $1}'`
+DNS="8.8.8.8 8.8.4.4"
+NET="any/0"
+SERV_TCP="22 443"
+SERV_UDP="53 123"
+HI_PORTS="1024:65535"
+NON_NET="10.0.0.0/8 224.0.0.0/4 240.0.0.0/5 169.254.0.0/16"
+#BADIPS=$(egrep -v -E "^#|^$" /root/scripts/blocked.fw)
+
+start()
+{
+# Delete all existing rules.
+$IPT -F
+$IPT -t nat -F
+$IPT -t mangle -F
+$IPT -X
+
+# Set up policies.
+$IPT -P INPUT DROP
+$IPT -P OUTPUT ACCEPT
+$IPT -P FORWARD DROP
+
+# Deny private networks
+for entry in $NON_NET; do
+#    $IPT -A INPUT -i $IF -s $entry -m limit --limit 1/s -j LOG --log-level 5 --log-prefix "BAD_NET: "
+    $IPT -A INPUT -i $IF -s $entry -j DROP
+done
+
+# Drop spoofing packets
+$IPT -A INPUT -i $IF -s $IP -d $IP -j DROP
+
+# SYN check
+$IPT -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
+
+# Drop fragments
+$IPT -A INPUT -i $IF -f -j DROP
+
+# Drop bad flags
+$IPT -A INPUT -i $IF -p tcp --tcp-flags SYN,RST SYN,RST -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags SYN,FIN SYN,FIN -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ACK,PSH PSH -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ACK,URG URG -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags FIN,ACK FIN -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags FIN,RST FIN,RST -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL FIN -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL ALL -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL NONE -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL FIN,PSH,URG -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL SYN,FIN -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL URG,PSH,SYN,FIN -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL SYN,RST,ACK,FIN,URG -j DROP
+
+# Drop broadcast / multicast
+$IPT -A INPUT -i $IF -m pkttype --pkt-type broadcast -j DROP
+$IPT -A INPUT -i $IF -m pkttype --pkt-type multicast -j DROP
+
+# Drop INVALID packets
+$IPT -A INPUT -i $IF -m state --state INVALID -j DROP
+
+# block all bad ips
+#for ip in $BADIPS; do
+#    $IPT -A INPUT -s $ip -j DROP
+#    $IPT -A OUTPUT -d $ip -j DROP
+#done
+
+# Always accept loopback traffic.
+$IPT -A INPUT -i lo -j ACCEPT
+
+# SSH and MySQL access logging.
+$IPT -A INPUT ! -i lo -p tcp -m multiport --dports 22,3306 -s 0/0 -d 0/0 --syn -j ULOG
+
+# Allow established connections.
+$IPT -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+$IPT -A INPUT -p tcp -i $IF -m state --state NEW -m recent --set
+$IPT -A INPUT -p tcp -i $IF -m state --state NEW -m recent --update --seconds 20 --hitcount 10 -j DROP
+
+# Drop UDP scan
+$IPT -A INPUT -p udp -m length --length 0:28 -j DROP
+
+# Allow protocols
+$IPT -A INPUT -p icmp --icmp-type 8 -j ACCEPT
+$IPT -A INPUT -i $IF -d $IP -p tcp -m multiport -m state --dports 22,80,443 --state NEW -m length --length 40:60 -j ACCEPT
+$IPT -A INPUT -d $IP -p udp -m multiport --dports 123 -j ACCEPT
+
+# Allow monitoring (nagios/cacti)
+$IPT -A INPUT -d $IP -p tcp -m tcp --dport 5666 -j ACCEPT
+$IPT -A INPUT -d $IP -p udp -m udp --dport 161 -j ACCEPT
+
+$IPT -A FORWARD -p tcp -i $IF -m state --state NEW -m recent --set
+$IPT -A FORWARD -p tcp -i $IF -m state --state NEW -m recent --update --seconds 20 --hitcount 10 -j DROP
+
+# Log bad packet
+$IPT -A INPUT -i $IF -d $IP -j DROP
+$IPT -A OUTPUT -o $IF -d $IP -j DROP
+$IPT -A FORWARD -i $IF -d $IP -j DROP
+
+# Disble routing.
+$echo 0 > /proc/sys/net/ipv4/ip_forward
+}
+
+stop()
+{
+# Delete all existing rules.
+$IPT -F
+$IPT -t nat -F
+$IPT -t mangle -F
+$IPT -X
+
+# Set up policies.
+$IPT -P INPUT ACCEPT
+$IPT -P OUTPUT ACCEPT
+$IPT -P FORWARD ACCEPT
+}
+
+case $1 in
+        start)
+                log_daemon_msg "Starting firewall"
+                start
+                log_end_msg $?
+                ;;
+        stop)
+                log_daemon_msg "Stopping firewall"
+                stop
+                log_end_msg $?
+                ;;
+        restart)
+                log_daemon_msg "Restarting firewall"
+                stop
+                        if [ -z "$?" -o "$?" = "0" ]; then
+                                start
+                        fi
+                log_end_msg $?
+                ;;
+        *)
+                echo "Usage: $0 {start|stop|restart}"
+                exit 2
+                ;;
+esac
