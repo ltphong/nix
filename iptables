@@ -32,9 +32,11 @@ TRUST_SSH="172.16.0.0/12"
 start() {
 ### Delete all existing rules
 $IPT -F
-$IPT -t nat -F
-$IPT -t mangle -F
 $IPT -X
+$IPT -t nat -F
+$IPT -t nat -X
+$IPT -t mangle -F
+$IPT -t mangle -X
 
 ### Set up policies
 $IPT -P INPUT DROP
@@ -61,21 +63,27 @@ $IPT -A INPUT -i $IF -f -j DROP
 ### Block bad flags
 $IPT -A INPUT -i $IF -p tcp --tcp-flags SYN,RST SYN,RST -s $NET -j DROP
 $IPT -A INPUT -i $IF -p tcp --tcp-flags SYN,FIN SYN,FIN -s $NET -j DROP
-$IPT -A INPUT -i $IF -p tcp --tcp-flags ACK,PSH PSH 	-s $NET -j DROP
-$IPT -A INPUT -i $IF -p tcp --tcp-flags ACK,URG URG 	-s $NET -j DROP
-$IPT -A INPUT -i $IF -p tcp --tcp-flags FIN,ACK FIN 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ACK,PSH PSH     -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ACK,URG URG     -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags FIN,ACK FIN     -s $NET -j DROP
 $IPT -A INPUT -i $IF -p tcp --tcp-flags FIN,RST FIN,RST -s $NET -j DROP
-$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL FIN 	-s $NET -j DROP
-$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL ALL 	-s $NET -j DROP
-$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL NONE 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL FIN         -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL ALL         -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL NONE        -s $NET -j DROP
 $IPT -A INPUT -i $IF -p tcp --tcp-flags ALL FIN,PSH,URG -s $NET -j DROP
-$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL SYN,FIN 	-s $NET -j DROP
-$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL URG,PSH,SYN,FIN	-s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL SYN,FIN     -s $NET -j DROP
+$IPT -A INPUT -i $IF -p tcp --tcp-flags ALL URG,PSH,SYN,FIN     -s $NET -j DROP
 $IPT -A INPUT -i $IF -p tcp --tcp-flags ALL SYN,RST,ACK,FIN,URG -s $NET -j DROP
 
 ### Drop broadcast / multicast
-$IPT -A INPUT -i $IF -m pkttype --pkt-type broadcast 	-s $NET -j DROP
-$IPT -A INPUT -i $IF -m pkttype --pkt-type multicast 	-s $NET -j DROP
+$IPT -A INPUT -i $IF -m pkttype --pkt-type broadcast    -s $NET -j DROP
+$IPT -A INPUT -i $IF -m pkttype --pkt-type multicast    -s $NET -j DROP
+
+### QoS
+$IPT -t mangle -A PREROUTING -p tcp --sport 22 -j TOS --set-tos Minimize-Delay
+$IPT -t mangle -A PREROUTING -p tcp --dport 22 -j TOS --set-tos Minimize-Delay
+# In not SYN flood
+$IPT -t mangle -A PREROUTING -p tcp --tcp-flags SYN,RST,ACK SYN -j TOS --set-tos Minimize-Delay
 
 ### Block bad guys
 #for ip in $BADIPS; do
@@ -94,17 +102,38 @@ $IPT -A INPUT ! -i lo -p tcp -m multiport --dports 22,3306 -s 0/0 -d 0/0 --syn -
 #$IPT -A INPUT -p tcp -i $IF -s $NET -m state --state NEW -m recent --update --seconds 20 --hitcount 10 -j DROP
 
 ### Drop UDP scan
-#$IPT -A INPUT -p udp -s $NET -m length --length 0:28 -j DROP
+$IPT -A INPUT -p udp -s $NET -m length --length 0:28 -j DROP
 
 ### SYN check
 $IPT -A INPUT -p tcp ! --syn -m state --state NEW -j DROP
 
-### Allow SSH from TRUSTED_IP
-$IPT -A INPUT  -i $IF -p tcp   --syn -s $TRUST_SSH -d $IP  --dport 22 -m state --state NEW -m length --length 40:60 -m limit --limit 3/s --limit-burst 5 -j ACCEPT
+### Allow SSH from TRUSTED_IP with connlimit
+### -m connlimit ! --connlimit-above 5
+### -m limit --limit 3/s --limit-burst 5
+### -m length --length 40:60
+$IPT -A INPUT  -i $IF -p tcp   --syn -s $TRUST_SSH -d $IP  --dport 22 -m state --state NEW -m length --length 40:60 -m connlimit ! --connlimit-above 5 -j ACCEPT
 $IPT -A OUTPUT -o $IF -p tcp ! --syn -s $IP  -d $TRUST_SSH --sport 22 -m state --state ESTABLISHED -j ACCEPT
 $IPT -A INPUT  -i $IF -p tcp ! --syn -s $TRUST_SSH -d $IP  --dport 22 -m state --state ESTABLISHED -j ACCEPT
 
-### Allow HTTP & other
+### SYN Flood
+#$IPT -N syn
+#$IPT -A syn -j ACCEPT
+#$IPT -N SYN_CHECK
+#$IPT -A SYN_CHECK -m recent --set --name SYN
+#$IPT -A INPUT -p tcp --syn -d $IP -m state --state NEW -j SYN_CHECK
+
+#$IPT -A SYN_CHECK -m recent --update --seconds 60 --hitcount 10 --name SYN -j LOG --log-prefix "FLOOD: "
+#$IPT -A SYN_CHECK -m recent --update --seconds 60 --hitcount 10 --name SYN -j DROP
+
+#$IPT -A SYN_CHECK -m recent --update --seconds 60 --hitcount 3 --name SYN -j syn
+#$IPT -A INPUT -p tcp ! --syn -d $IP -m state --state ESTABLISHED -j ACCEPT
+#$IPT -A OUTPUT -p tcp -s $IP -m state --state ESTABLISHED -j ACCEPT
+
+#$IPT -t mangle -N blockip
+#$IPT -t mangle -A blockip -j DROP
+#$IPT -t mangle -A PREROUTING -p tcp -d $IP -m recent --name SYN --update --hitcount 10 --seconds 120 -j blockip
+
+### Allow HTTP & other with connection rate limit
 for port in $SERV_TCP; do
 $IPT -A INPUT  -i $IF -p tcp   --syn -s $NET -d $IP  --dport $port -m state --state NEW -m length --length 40:60 -m limit --limit 3/s --limit-burst 5 -j ACCEPT
 $IPT -A OUTPUT -o $IF -p tcp ! --syn -s $IP  -d $NET --sport $port -m state --state ESTABLISHED -j ACCEPT
@@ -118,15 +147,15 @@ then
 $IPT -A INPUT -i $IF -p udp -s $NET --sport $port -d $IP --dport $port -m state --state NEW,ESTABLISHED -m limit --limit 2/s --limit-burst 2 -j ACCEPT
 $IPT -A OUTPUT -o $IF -p udp -s $IP --sport $port -d $NET --dport $port -m state --state ESTABLISHED -m limit --limit 2/s --limit-burst 2 -j ACCEPT
 else
-$IPT -A INPUT -i $IF -p udp -s $NET --sport $HI_PORTS -d $IP --dport $port -m state --state NEW -j ACCEPT
+$IPT -A INPUT -i $IF -p udp -s $NET --sport $HI_PORTS -d $IP --dport $port -m state --state NEW,ESTABLISHED -m limit --limit 2/s --limit-burst 2 -j ACCEPT
 $IPT -A OUTPUT -o $IF -p udp -s $IP --sport $port -d $NET --dport $HI_PORTS -m state --state ESTABLISHED -j ACCEPT
 fi
 done
 
-### Allow ICMP
+### Allow ICMP. Limit ICMP lenght: -m length 42:43
 for item in $OK_ICMP; do
-$IPT -A INPUT -i $IF -s $NET -p icmp --icmp-type $item -m length --length 42:43 -m limit --limit 1/s --limit-burst 1 -j ACCEPT
-$IPT -A OUTPUT -o $IF -s $IP -p icmp --icmp-type $item -m length --length 42:43 -m limit --limit 1/s --limit-burst 1 -j ACCEPT
+$IPT -A INPUT -i $IF -s $NET -p icmp --icmp-type $item -m state --state NEW,ESTABLISHED -m limit --limit 1/s --limit-burst 1 -j ACCEPT
+$IPT -A OUTPUT -o $IF -s $IP -p icmp --icmp-type $item -m state --state NEW,ESTABLISHED -m limit --limit 1/s --limit-burst 1 -j ACCEPT
 done
 
 ### Allow OUT - UDP (53) TCP (80,443,25)
